@@ -71,7 +71,6 @@ Create a `.env` file **one directory above** `cve_watch.py`:
 DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/XXXX/YYYY
 ```
 
-> ⚠️ Never commit `.env` — use `.env.example` as a template.
 
 ---
 
