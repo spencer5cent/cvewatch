@@ -1,0 +1,22 @@
+# Secrets (ignore real env files)
+.env
+
+# Runtime state
+state.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtualenv
+venv/
+.venv/
+
+# OS / editor noise
+.DS_Store
+.idea/
+.vscode/
+
+# Logs
+*.log
