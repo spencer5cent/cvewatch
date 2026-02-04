@@ -204,6 +204,7 @@ https://nvd.nist.gov/vuln/detail/CVE-2026-25223
 ```
 
 📸 **Discord alert screenshots**
+
 ![discord](https://github.com/user-attachments/assets/a26c9b8c-91d4-42ef-9c66-276d17c26709)
 
 
