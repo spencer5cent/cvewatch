@@ -2,42 +2,44 @@
 
 **High-signal CVE monitoring for bug bounty hunters and pentesters**
 
-`cvewatch` is a lightweight CLI tool that continuously monitors the NVD for **new or recently updated CVEs** and filters them down to **actually exploitable, bug-bounty-relevant vulnerabilities** — then sends alerts to Discord.
+`cvewatch` is a lightweight CLI tool that monitors the NVD for **new or recently modified CVEs** and filters them down to **actually exploitable, bug-bounty-relevant vulnerabilities**, then sends alerts to Discord.
 
-This tool is opinionated by design: it favors **remote, unauthenticated, low-interaction bugs** (SSRF, deserialization, uploads, APIs, proxies, etc.) over noisy or low-impact issues.
+This tool is intentionally opinionated: it favors **remote, unauthenticated, low-interaction bugs** (SSRF, deserialization, uploads, APIs, proxies, etc.) over noisy or theoretical issues.
 
 ---
 
 ## Why cvewatch exists
 
 Most CVE feeds are:
-- too noisy
-- too late
-- full of local / physical / theoretical bugs
+- extremely noisy
+- full of local / physical / low-impact bugs
 - not aligned with real-world web exploitation
+- hard to automate meaningfully
 
 `cvewatch` is built for:
 - bug bounty hunters
-- web app pentesters
-- cloud / API / identity researchers
+- web / API pentesters
+- cloud & identity researchers
 
-It answers:
+It answers one question well:
 
-> “What CVEs dropped *recently* that I might actually exploit?”
+> **“What CVEs changed recently that I might actually exploit?”**
 
 ---
 
-## What it does
+## What cvewatch does (important)
 
-- Queries the NVD CVE API on a rolling time window
-- Filters by **CVSS score**
-- Requires **AV:N (network exploitable)** by default
-- Optional filters for:
-  - No authentication required (PR:N)
-  - No user interaction required (UI:N)
-  - PoC / exploit-style language
-  - Keyword / tag matching
-- De-duplicates alerts using a local state file with TTL
+- Queries the **NVD CVE API**
+- **ONLY returns CVEs that are new or modified within the last 48 hours**
+  - configurable via `-window`
+- Filters by:
+  - CVSS score
+  - Network exploitable only (**AV:N**) — always required
+  - Optional no authentication (**PR:N**)
+  - Optional no user interaction (**UI:N**)
+  - Optional PoC / exploit-style language
+  - Optional keyword tags
+- De-duplicates alerts using a local state file (TTL-based)
 - Sends alerts to Discord
 - Designed to run unattended via **systemd timers**
 
@@ -47,16 +49,16 @@ It answers:
 
 ### Requirements
 - Python 3.10+
-- `requests` library
-- Linux (recommended for systemd usage)
+- `requests`
+- Linux (recommended for systemd automation)
 
-### Clone the repository
+### Clone
 ```bash
 git clone https://github.com/spencer5cent/cvewatch.git
 cd cvewatch
 ```
 
-### Install dependencies
+### Install dependency
 ```bash
 pip3 install requests
 ```
@@ -71,6 +73,24 @@ Create a `.env` file **one directory above** `cve_watch.py`:
 DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/XXXX/YYYY
 ```
 
+> ⚠️ Never commit `.env`  
+> Use `.env.example` as a template.
+
+---
+
+## Optional: create a shell alias
+
+This allows you to run `cvewatch` from anywhere.
+
+```bash
+echo "alias cvewatch='python3 /path/to/cvewatch/cve_watch.py'" >> ~/.bashrc
+source ~/.bashrc
+```
+
+Example:
+```bash
+cvewatch -min 8.5 -no-auth -no-ui -tags ssrf
+```
 
 ---
 
@@ -78,7 +98,7 @@ DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/XXXX/YYYY
 
 Basic example:
 ```bash
-python3 cve_watch.py -min 7 -no-auth -no-ui -tags web
+cvewatch -min 7 -no-auth -no-ui -tags web
 ```
 
 Send a test Discord message:
@@ -93,12 +113,50 @@ cvewatch -clear-state
 
 ---
 
+## Year filtering (`-year`)
+
+**Default behavior:**  
+If no `-year` flag is provided, `cvewatch` only includes:
+
+> **CVE years 2018 → present**
+
+You can override this using the `-year` flag.
+
+### Supported formats
+
+Single year:
+```bash
+-year 2020
+```
+
+Multiple years:
+```bash
+-year 2016,2020
+```
+
+Ranges:
+```bash
+-year 2020-2022
+```
+
+Mixed:
+```bash
+-year 2021,2010-2012
+```
+
+Example:
+```bash
+cvewatch -year 2019-2021 -poc -tags upload
+```
+
+---
+
 ## Flags & Options
 
 ```
 -min <score>        Minimum CVSS score (default: 9.0)
 -max <score>        Maximum CVSS score (default: 10.0)
--window <hours>     Lookback window in hours (default: 48)
+-window <hours>     Lookback window for modified CVEs (default: 48)
 
 -no-auth            Require no authentication (PR:N)
 -no-ui              Require no user interaction (UI:N)
@@ -107,127 +165,62 @@ cvewatch -clear-state
 -tags <list>        Comma-separated keyword tags
                     Example: web,ssrf,api,upload
 
--state <hours>      State TTL in hours (default: 2)
+-year <spec>        CVE year filter
+                    Examples:
+                      2020
+                      2016,2020
+                      2020-2022
+                    Default: 2018 → present
+
+-state <hours>      State TTL to suppress repeat alerts (default: 2)
 -clear-state        Clear stored CVE state only
 -send-test          Send a Discord test message
--dry-run            Print output without sending
+-dry-run            Print output without sending to Discord
 -debug              Verbose debug output
 ```
 
 ---
 
-## Tags
+## Example Output
 
-Tags are **keyword-based**, not strict categories. They help reduce noise.
-
-Recommended high-signal tags:
-- ssrf
-- proxy
-- api
-- upload
-- deserialization
-- graphql
-- gateway
-- oauth
-- jwt
-
-Example:
+Command:
 ```bash
-cvewatch -min 8 -no-auth -no-ui -tags ssrf,api
+cvewatch -min 5 -poc -no-auth -no-ui -tags web
 ```
+
+Output:
+```
+🚨 **CVE-2026-1065** (CVSS 7.2)
+The Form Maker by 10Web plugin for WordPress is vulnerable to Stored Cross-Site Scripting...
+https://nvd.nist.gov/vuln/detail/CVE-2026-1065
+
+🚨 **CVE-2026-24992** (CVSS 5.3)
+Insertion of Sensitive Information Into Sent Data vulnerability in WPFactory Advanced WooCommerce Product Sales Reporting...
+https://nvd.nist.gov/vuln/detail/CVE-2026-24992
+
+🚨 **CVE-2026-25223** (CVSS 7.5)
+Fastify validation bypass via malformed Content-Type header...
+https://nvd.nist.gov/vuln/detail/CVE-2026-25223
+```
+
+📸 **Discord alert screenshots**
+(Add screenshots here)
 
 ---
 
-## Automation (systemd Timers)
+## Automation (systemd)
 
 `cvewatch` is designed to run unattended using **systemd timers**.
 
-### Hourly high-signal check
+Typical setups:
+- Hourly high-severity monitoring
+- Twice-daily broader scans
+
+Example commands:
 ```bash
 cvewatch -min 8.5 -poc -no-auth -no-ui -tags web
+cvewatch -min 5 -poc -no-auth -no-ui -tags web
 ```
-
-### Twice-daily broad check
-```bash
-cvewatch -min 5 -poc -no-auth -no-ui -tags web -send-test
-```
-
-
-### systemd setup (recommended)
-
-Create two services and two timers.
-
----
-
-#### Hourly high-signal scan (CVSS ≥ 8.5)
-
-Create `/etc/systemd/system/cvewatch-hourly.service`:
-```
-[Unit]
-Description=CVEWatch Hourly High-Signal Scan
-
-[Service]
-Type=oneshot
-WorkingDirectory=/path/to/cvewatch
-ExecStart=/usr/bin/python3 /path/to/cvewatch/cve_watch.py -min 8.5 -poc -no-auth -no-ui -tags web
-```
-
-Create `/etc/systemd/system/cvewatch-hourly.timer`:
-```
-[Unit]
-Description=CVEWatch Hourly Timer
-
-[Timer]
-OnCalendar=hourly
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-```
-
----
-
-#### Twice-daily broader scan (CVSS ≥ 5)
-
-Create `/etc/systemd/system/cvewatch-daily.service`:
-```
-[Unit]
-Description=CVEWatch Twice Daily Broad Scan
-
-[Service]
-Type=oneshot
-WorkingDirectory=/path/to/cvewatch
-ExecStart=/usr/bin/python3 /path/to/cvewatch/cve_watch.py -min 5 -poc -no-auth -no-ui -tags web
-```
-
-Create `/etc/systemd/system/cvewatch-daily.timer`:
-```
-[Unit]
-Description=CVEWatch Twice Daily Timer
-
-[Timer]
-OnCalendar=*-*-* 10:30:00
-OnCalendar=*-*-* 18:00:00
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-```
-
----
-
-Enable and start timers:
-```
-sudo systemctl daemon-reload
-sudo systemctl enable --now cvewatch-hourly.timer cvewatch-daily.timer
-```
-
-Verify:
-```
-systemctl list-timers | grep cvewatch
-```
-
-> 💡 Use `-send-test` once manually to confirm Discord delivery.
 
 ---
 
