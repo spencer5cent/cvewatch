@@ -2,25 +2,33 @@
 import os, sys, json, argparse, requests, datetime, re, time
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-ENV_PATH = os.path.abspath(os.path.join(BASE_DIR, "..", ".env"))
+ENV_CANDIDATES = [
+    os.path.join(BASE_DIR, ".env"),
+    os.path.join(BASE_DIR, "..", ".env"),
+]
 STATE_FILE = os.path.join(BASE_DIR, "state.json")
 UTC = datetime.timezone.utc
 NVD_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 
 POC_RE = re.compile(r"exploit|poc|proof[- ]?of[- ]?concept|bypass|rce|upload", re.I)
 
-def utcnow():
-    return datetime.datetime.now(UTC)
-
 def load_env():
-    if os.path.exists(ENV_PATH):
-        for line in open(ENV_PATH):
-            if "=" in line and not line.startswith("#"):
-                k, v = line.strip().split("=", 1)
-                os.environ[k] = v.strip().strip('"')
+    for path in ENV_CANDIDATES:
+        if os.path.exists(path):
+            for line in open(path):
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k, v.strip().strip('"'))
 
 load_env()
+
+NVD_KEY = os.getenv("NVD_API_KEY")
 WEBHOOK = os.getenv("DISCORD_WEBHOOK_CVES") or os.getenv("DISCORD_WEBHOOK_URL")
+
+def utcnow():
+    return datetime.datetime.now(UTC)
 
 def load_state():
     if not os.path.exists(STATE_FILE):
@@ -35,14 +43,14 @@ def save_state(state):
     json.dump(state, open(tmp, "w"), indent=2)
     os.replace(tmp, STATE_FILE)
 
-def safe_fetch(params):
-    try:
-        r = requests.get(NVD_URL, params=params, timeout=30)
-        if r.status_code != 200 or not r.text.strip():
-            return None
-        return r.json()
-    except Exception:
+def fetch_nvd(params):
+    headers = {}
+    if NVD_KEY:
+        headers["apiKey"] = NVD_KEY
+    r = requests.get(NVD_URL, params=params, headers=headers, timeout=30)
+    if r.status_code != 200 or not r.text.strip():
         return None
+    return r.json()
 
 def cvss_ok(metrics, min_s, no_auth):
     for m in metrics:
@@ -79,7 +87,7 @@ def process_window(hours, publish_only):
     params[key] = (now - datetime.timedelta(hours=hours)).isoformat()
     params[key.replace("Start", "End")] = now.isoformat()
 
-    data = safe_fetch(params)
+    data = fetch_nvd(params)
     if not data:
         return 0
 
@@ -130,10 +138,8 @@ def process_window(hours, publish_only):
 
     return added
 
-# -------- MODE SWITCH --------
-
 if args.fill_state:
-    for h in (8760, 7000, 5000, 3000, 2000, 1500, 1000, 750, 500, 250):
+    for h in (8760, 6000, 4000, 2000, 1000, 500, 250):
         process_window(h, False)
         save_state(state)
         time.sleep(90)
