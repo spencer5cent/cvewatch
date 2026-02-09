@@ -1,41 +1,35 @@
 #!/usr/bin/env python3
-import os, sys, json, argparse, requests, datetime, re, time
+import os, json, argparse, requests, datetime, re, time
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-ENV_CANDIDATES = [
-    os.path.join(BASE_DIR, ".env"),
-    os.path.join(BASE_DIR, "..", ".env"),
-]
 STATE_FILE = os.path.join(BASE_DIR, "state.json")
 UTC = datetime.timezone.utc
 NVD_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+PAGE_SIZE = 200
+MAX_LEN = 1800
 
-POC_RE = re.compile(r"exploit|poc|proof[- ]?of[- ]?concept|bypass|rce|upload", re.I)
+POC_RE = re.compile(
+    r"\b(proof[- ]?of[- ]?concept|\bpoc\b|exploit code|public exploit|metasploit|exploit[- ]?db|github\.com)\b",
+    re.I
+)
 
 def load_env():
-    for path in ENV_CANDIDATES:
-        if os.path.exists(path):
-            for line in open(path):
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                os.environ.setdefault(k, v.strip().strip('"'))
+    for p in (".env", "../.env"):
+        fp = os.path.join(BASE_DIR, p)
+        if os.path.exists(fp):
+            for line in open(fp):
+                if "=" in line and not line.lstrip().startswith("#"):
+                    k, v = line.strip().split("=", 1)
+                    os.environ.setdefault(k, v.strip('"'))
 
 load_env()
-
 NVD_KEY = os.getenv("NVD_API_KEY")
 WEBHOOK = os.getenv("DISCORD_WEBHOOK_CVES") or os.getenv("DISCORD_WEBHOOK_URL")
 
-def utcnow():
-    return datetime.datetime.now(UTC)
-
 def load_state():
-    if not os.path.exists(STATE_FILE):
-        return {"sent": {}}
     try:
         return json.load(open(STATE_FILE))
-    except Exception:
+    except:
         return {"sent": {}}
 
 def save_state(state):
@@ -43,107 +37,136 @@ def save_state(state):
     json.dump(state, open(tmp, "w"), indent=2)
     os.replace(tmp, STATE_FILE)
 
-def fetch_nvd(params):
-    headers = {}
-    if NVD_KEY:
-        headers["apiKey"] = NVD_KEY
-    r = requests.get(NVD_URL, params=params, headers=headers, timeout=30)
-    if r.status_code != 200 or not r.text.strip():
-        return None
-    return r.json()
+def fetch_all(params):
+    start = 0
+    headers = {"apiKey": NVD_KEY} if NVD_KEY else {}
+    while True:
+        p = dict(params, resultsPerPage=PAGE_SIZE, startIndex=start)
+        r = requests.get(NVD_URL, params=p, headers=headers, timeout=30)
+        if r.status_code != 200:
+            return
+        data = r.json()
+        vulns = data.get("vulnerabilities", [])
+        if not vulns:
+            return
+        for v in vulns:
+            yield v
+        start += PAGE_SIZE
+        if start >= data.get("totalResults", 0):
+            return
 
 def cvss_ok(metrics, min_s, no_auth):
     for m in metrics:
-        cvss = m.get("cvssData", {})
-        score = cvss.get("baseScore", 0)
-        vector = cvss.get("vectorString", "")
-        if score < min_s:
-            continue
-        if "AV:N" not in vector:
-            continue
-        if no_auth and "PR:N" not in vector:
-            continue
-        return score, vector
+        d = m.get("cvssData", {})
+        s = d.get("baseScore", 0)
+        v = d.get("vectorString", "")
+        if s >= min_s and "AV:N" in v and (not no_auth or "PR:N" in v):
+            return s, v
     return None, None
 
+def send_chunks(text):
+    if not WEBHOOK:
+        return
+    buf = ""
+    for line in text.split("\n"):
+        if len(buf) + len(line) + 1 > MAX_LEN:
+            requests.post(WEBHOOK, json={"content": buf})
+            time.sleep(1)
+            buf = line
+        else:
+            buf += ("\n" if buf else "") + line
+    if buf:
+        requests.post(WEBHOOK, json={"content": buf})
+
 ap = argparse.ArgumentParser()
+ap.add_argument("-window", type=int, default=12)
 ap.add_argument("-min", type=float, default=5.0)
-ap.add_argument("-window", type=int, default=48)
 ap.add_argument("-no-auth", action="store_true")
 ap.add_argument("-poc", action="store_true")
 ap.add_argument("-why", action="store_true")
-ap.add_argument("-new-only", action="store_true")
-ap.add_argument("-fill-state", action="store_true")
+ap.add_argument("--digest", action="store_true")
 ap.add_argument("-dry-run", action="store_true")
 args = ap.parse_args()
 
+now = datetime.datetime.now(UTC)
 state = load_state()
 sent = state.setdefault("sent", {})
-now = utcnow()
 
-def process_window(hours, publish_only):
-    params = {"resultsPerPage": 200}
-    key = "pubStartDate" if publish_only else "lastModStartDate"
-    params[key] = (now - datetime.timedelta(hours=hours)).isoformat()
-    params[key.replace("Start", "End")] = now.isoformat()
+params = {
+    "lastModStartDate": (now - datetime.timedelta(hours=args.window)).isoformat(),
+    "lastModEndDate": now.isoformat()
+}
 
-    data = fetch_nvd(params)
-    if not data:
-        return 0
+digest_blocks = []
+alerts = []
 
-    added = 0
-    for item in data.get("vulnerabilities", []):
-        cve = item.get("cve", {})
-        cid = cve.get("id")
-        if not cid or not cid.startswith("CVE-"):
-            continue
+for item in fetch_all(params):
+    c = item.get("cve", {})
+    cid = c.get("id")
+    if not cid:
+        continue
 
-        metrics = []
-        for k in ("cvssMetricV31", "cvssMetricV30"):
-            metrics += cve.get("metrics", {}).get(k, [])
+    metrics = []
+    for k in ("cvssMetricV31", "cvssMetricV30"):
+        metrics += c.get("metrics", {}).get(k, [])
 
-        score, vector = cvss_ok(metrics, args.min, args.no_auth)
-        if not score:
-            continue
+    score, vector = cvss_ok(metrics, args.min, args.no_auth)
+    if not score:
+        continue
 
-        desc = cve.get("descriptions", [{}])[0].get("value", "")
-        has_poc = bool(POC_RE.search(desc))
+    desc = c.get("descriptions", [{}])[0].get("value", "")
+    has_poc = bool(POC_RE.search(desc))
+    prev = sent.get(cid)
 
-        prev = sent.get(cid)
-        if prev:
-            if not prev.get("had_poc") and has_poc:
-                why = "POC_ADDED"
-            else:
-                continue
-        else:
-            why = "NEW"
+    if args.digest:
+        block = (
+            f"🚨 **{cid}**\n"
+            f"CVSS: {score} ({vector})\n"
+            f"{desc}\n"
+            f"https://nvd.nist.gov/vuln/detail/{cid}"
+        )
+        digest_blocks.append(block)
+        continue
 
-        sent[cid] = {
-            "first_seen": prev.get("first_seen", now.isoformat()) if prev else now.isoformat(),
-            "had_poc": has_poc,
-            "cvss": score,
-            "vector": vector
-        }
+    why = []
+    if not prev:
+        why.append("New CVE")
+    elif args.poc and not prev.get("had_poc") and has_poc:
+        why.append("PoC added")
+    else:
+        continue
 
-        if not args.fill_state:
-            msg = f"🚨 **{cid}**\nCVSS: {score} ({vector})"
-            if args.why:
-                msg += f"\nWHY: {why}"
-            msg += f"\n{desc}\nhttps://nvd.nist.gov/vuln/detail/{cid}"
-            print(msg)
-            if WEBHOOK and not args.dry_run:
-                requests.post(WEBHOOK, json={"content": msg})
+    if args.why:
+        if score >= 9:
+            why.append("Critical severity")
+        elif score >= 7:
+            why.append("High severity")
+        if "AV:N" in vector and "PR:N" in vector:
+            why.append("Remote unauthenticated")
 
-        added += 1
+    sent[cid] = {
+        "first_seen": prev.get("first_seen", now.isoformat()) if prev else now.isoformat(),
+        "had_poc": has_poc,
+        "cvss": score,
+        "vector": vector
+    }
 
-    return added
+    msg = f"🚨 **{cid}**\nCVSS: {score} ({vector})"
+    if args.why and why:
+        msg += "\nWHY:\n- " + "\n- ".join(why)
+    msg += f"\n{desc}\nhttps://nvd.nist.gov/vuln/detail/{cid}"
+    alerts.append(msg)
 
-if args.fill_state:
-    for h in (8760, 6000, 4000, 2000, 1000, 500, 250):
-        process_window(h, False)
-        save_state(state)
-        time.sleep(90)
-    sys.exit(0)
+out = []
+if args.digest and digest_blocks:
+    out.append(f"🗞️ **CVE Digest (last {args.window}h)**")
+    out.extend(digest_blocks)
+elif alerts:
+    out.extend(alerts)
 
-process_window(args.window, args.new_only)
+final = "\n".join(out)
+print(final)
+if not args.dry_run and final:
+    send_chunks(final)
+
 save_state(state)
