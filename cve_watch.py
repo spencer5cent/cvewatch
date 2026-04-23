@@ -69,6 +69,7 @@ WEB_PRODUCTS = [
     "phpmyadmin",
     "laravel", "symfony", "codeigniter", "yii", "cakephp",
     "wordpress",
+    "kali forms",
     "drupal",
     "joomla",
     "magento",
@@ -83,6 +84,7 @@ WEB_PRODUCTS = [
     "django",
     "flask",
     "fastapi",
+    "marimo",
     # Ruby
     "ruby on rails", "rails",
     # Node / JS
