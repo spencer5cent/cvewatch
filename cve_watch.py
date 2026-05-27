@@ -405,6 +405,7 @@ for item in fetch_nvd(params):
         continue
 
     checked += 1
+
     desc_obj = next((d for d in c.get("descriptions", []) if d.get("lang") == "en"), {})
     desc = desc_obj.get("value", "") or c.get("descriptions", [{}])[0].get("value", "")
 
@@ -436,6 +437,17 @@ for item in fetch_nvd(params):
     prev_seen = cid in sent
     prev_poc = poc_state.get(cid, False)
     poc_new = has_poc and not prev_poc
+
+    # NVD backfills old CVEs when updating metadata (CVSS scores, references), causing them
+    # to surface in lastModStartDate queries. Skip pre-2022 CVEs unless they have an active
+    # PoC signal — those are worth knowing about even if old.
+    try:
+        cve_year = int(cid.split("-")[1])
+        if cve_year < 2022 and not has_poc:
+            skip(f"year {cve_year} < 2022 and no PoC (NVD backfill noise)")
+            continue
+    except (IndexError, ValueError):
+        pass
 
     if args.new_only and prev_seen:
         skip("already seen (new-only mode)")
