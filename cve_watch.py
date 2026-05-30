@@ -345,7 +345,13 @@ def send_discord(text):
     if buf:
         chunks.append(buf)
     for chunk in chunks:
-        requests.post(WEBHOOK, json={"content": chunk})
+        import subprocess, json as json_module
+        payload = json_module.dumps({"content": chunk})
+        subprocess.run(
+            ["curl", "-s", "-o", "/dev/null", "-X", "POST", WEBHOOK,
+             "-H", "Content-Type: application/json", "-d", payload],
+            timeout=15
+        )
         if len(chunks) > 1:
             time.sleep(0.5)
 
