@@ -24,6 +24,11 @@ POC_RE = re.compile(
     r"github\.com.*exploit",
     re.I,
 )
+POC_URL_RE = re.compile(
+    r"(?:exploit-db\.com|packetstormsecurity\.com|metasploit|/poc(?:/|[-_])|"
+    r"(?:^|[/_-])exploit(?:[/_.-]|$)|github\.com/[^/]+/(?:cve[-_]?\d{4}[-_]\d+|[^/]*(?:poc|exploit)[^/]*))",
+    re.I,
+)
 
 # ── Web-tier products ─────────────────────────────────────────────────────────
 # Web-tier: common externally-exposed apps and frameworks seen in real-world scopes.
@@ -260,9 +265,10 @@ def load_state():
     try:
         raw = json.load(open(STATE_FILE))
     except Exception:
-        return {"sent": {}, "poc": {}}
+        return {"sent": {}, "poc": {}, "poc_refs": {}}
     sent = raw.get("sent", {})
     poc = raw.get("poc", {})
+    poc_refs = raw.get("poc_refs", {})
     # Migrate old format where sent values were dicts (first_seen, had_poc, etc.)
     new_sent = {}
     for k, v in sent.items():
@@ -272,7 +278,7 @@ def load_state():
                 poc[k] = v.get("had_poc", False)
         else:
             new_sent[k] = v
-    return {"sent": new_sent, "poc": poc}
+    return {"sent": new_sent, "poc": poc, "poc_refs": poc_refs}
 
 
 def save_state(state):
@@ -281,16 +287,29 @@ def save_state(state):
     os.replace(tmp, STATE_FILE)
 
 
+FETCH_FAILED = False
+
+
 def fetch_nvd(params):
+    global FETCH_FAILED
     headers = {"apiKey": NVD_KEY} if NVD_KEY else {}
     start = 0
     while True:
         p = dict(params, resultsPerPage=200, startIndex=start)
-        try:
-            r = requests.get(NVD_URL, params=p, headers=headers, timeout=30)
-            r.raise_for_status()
-        except Exception as e:
-            print(f"NVD fetch error: {e}", file=sys.stderr)
+        last_error = None
+        for attempt in range(3):
+            try:
+                r = requests.get(NVD_URL, params=p, headers=headers, timeout=45)
+                r.raise_for_status()
+                last_error = None
+                break
+            except Exception as e:
+                last_error = e
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+        if last_error is not None:
+            FETCH_FAILED = True
+            print(f"NVD fetch failed after 3 attempts at startIndex={start}: {last_error}", file=sys.stderr)
             return
         data = r.json()
         vulns = data.get("vulnerabilities", [])
@@ -327,6 +346,19 @@ def find_one(text, lst):
         if item in t:
             return item
     return None
+
+
+def poc_reference_urls(cve):
+    """Return strong PoC/exploit references without treating every GitHub patch as a PoC."""
+    found = []
+    for ref in cve.get("references", []):
+        url = (ref.get("url") or "").strip()
+        tags = {str(tag).lower() for tag in ref.get("tags", [])}
+        if not url:
+            continue
+        if "exploit" in tags or POC_URL_RE.search(url):
+            found.append(url)
+    return sorted(set(found))
 
 
 def send_discord(text):
@@ -380,7 +412,7 @@ ap.add_argument("-send-test", action="store_true",
 args = ap.parse_args()
 
 if args.clear_state:
-    json.dump({"sent": {}, "poc": {}}, open(STATE_FILE, "w"), indent=2)
+    json.dump({"sent": {}, "poc": {}, "poc_refs": {}}, open(STATE_FILE, "w"), indent=2)
     print("State cleared.")
     sys.exit(0)
 
@@ -402,6 +434,7 @@ params = {
 state = load_state()
 sent = state["sent"]
 poc_state = state["poc"]
+poc_refs_state = state["poc_refs"]
 alerted, checked = 0, 0
 
 for item in fetch_nvd(params):
@@ -439,10 +472,18 @@ for item in fetch_nvd(params):
         continue
 
     # 3. PoC / dedup logic
-    has_poc = bool(POC_RE.search(desc))
+    has_poc_text = bool(POC_RE.search(desc))
+    reference_pocs = poc_reference_urls(c)
+    has_poc = has_poc_text or bool(reference_pocs)
     prev_seen = cid in sent
     prev_poc = poc_state.get(cid, False)
-    poc_new = has_poc and not prev_poc
+    refs_were_baselined = cid in poc_refs_state
+    previous_refs = set(poc_refs_state.get(cid, []))
+    new_poc_refs = sorted(set(reference_pocs) - previous_refs) if refs_were_baselined else []
+    # Existing state predates reference tracking. Baseline its current references
+    # without flooding Discord; future reference additions will create an upgrade.
+    poc_refs_state[cid] = reference_pocs
+    poc_new = (has_poc_text and not prev_poc) or bool(new_poc_refs)
 
     # NVD backfills old CVEs when updating metadata (CVSS scores, references), causing them
     # to surface in lastModStartDate queries. Skip pre-2022 CVEs unless they have an active
@@ -491,6 +532,8 @@ for item in fetch_nvd(params):
     if args.why:
         msg += f"\n**Products:** {', '.join(matched_products[:3])}"
         msg += f"\n**Vuln:** {', '.join(matched_vulns[:3])}"
+        if new_poc_refs:
+            msg += f"\n**New exploit reference:** {new_poc_refs[0]}"
 
     print(msg)
     print()
@@ -503,7 +546,10 @@ for item in fetch_nvd(params):
 
 state["sent"] = sent
 state["poc"] = poc_state
+state["poc_refs"] = poc_refs_state
 if not args.dry_run:
     save_state(state)
 
 print(f"Done — {alerted} alert(s) from {checked} CVEs evaluated.")
+if FETCH_FAILED:
+    sys.exit(1)
