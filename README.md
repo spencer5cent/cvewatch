@@ -1,42 +1,33 @@
-CVEWatch tracks CVEs and alerts when they become more interesting
-(e.g. new CVE, PoC appears, exploitability increases).
+# CVEWatch
 
-What it does
-  ∙ Pulls CVEs from NVD (with pagination)
-  ∙ Filters by CVSS, network attack vector, auth requirements
-  ∙ Maintains a state file to avoid duplicate alerts
-  ∙ Alerts only on meaningful changes (NEW, PoC added)
-  ∙ Optional digest mode for awareness
-  ∙ Discord notifications optional
+CVEWatch polls NVD for high-impact network-reachable web and network CVEs and
+sends deduplicated Discord alerts.
 
-State File
-Tracks what you’ve seen before:
-  ∙ First seen timestamp
-  ∙ PoC status
-  ∙ Last alerted state
+It alerts when a matching CVE is first seen or when a later NVD update adds a
+strong PoC/exploit signal. PoC detection uses both description text and
+reference deltas: NVD `Exploit` tags plus conservative exploit/PoC URL shapes.
+Existing state is baselined when reference tracking is first deployed, so it
+does not replay the historical catalog.
 
-Alert Triggers
-Alerts fire only when:
-  ∙ CVE is first seen (NEW)
-  ∙ PoC appears after initial discovery
+`state.json` stores first-alert timestamps, PoC booleans, and the strong exploit
+reference set last observed for each CVE. NVD pages are retried three times. A
+terminal page-fetch failure exits nonzero after preserving already processed
+state, allowing systemd to expose partial feed failures instead of treating a
+zero-alert partial run as healthy.
 
-Digest Mode
-Stateless awareness mode:
-  ∙ Ignores state
-  ∙ Shows all matching CVEs in a time window
-  ∙ Includes full CVE details
-  ∙ Output is chunked to avoid Discord limits
+Common usage:
 
-Common Usage
+```bash
+# Inspect the last day without Discord or state changes.
+python3 cve_watch.py -window 24 -dry-run -why
 
-Fill state (no alerts):
-cvewatch -window 8760 -min 5 -no-auth -dry-run
+# Normal stateful alerting.
+python3 cve_watch.py -window 26 -why
 
-Hourly alerting (fast signal):
-cvewatch -window 24 -min 7 -no-auth -poc -why
+# Restrict to web or network products.
+python3 cve_watch.py -window 24 -tier web
+python3 cve_watch.py -window 24 -tier network
+```
 
-Digest / awareness run:
-cvewatch -window 12 -min 5 --digest
-
-Automation
-Designed to run via systemd timers or cron.
+The VPS runs an hourly daytime timer with a two-hour overlap and an 08:00 daily
+26-hour catch-up timer.
