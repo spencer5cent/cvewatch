@@ -261,6 +261,10 @@ def load_env():
 load_env()
 NVD_KEY = os.getenv("NVD_API_KEY")
 WEBHOOK = os.getenv("DISCORD_WEBHOOK_CVES") or os.getenv("DISCORD_WEBHOOK_URL")
+CVEWATCH_DISCORD_SETTINGS_FILE = os.getenv(
+    "CVEWATCH_DISCORD_SETTINGS_FILE",
+    "",
+)
 
 
 def utcnow():
@@ -368,7 +372,7 @@ def poc_reference_urls(cve):
 
 
 def send_discord(text):
-    if not WEBHOOK:
+    if not WEBHOOK or not cvewatch_discord_enabled():
         return
     # Chunk if over Discord's limit
     chunks, buf = [], ""
@@ -392,6 +396,17 @@ def send_discord(text):
         )
         if len(chunks) > 1:
             time.sleep(0.5)
+
+
+def cvewatch_discord_enabled():
+    if not CVEWATCH_DISCORD_SETTINGS_FILE:
+        return True
+    try:
+        with open(CVEWATCH_DISCORD_SETTINGS_FILE) as fp:
+            saved = json.load(fp)
+        return saved.get("enabled", True) is not False
+    except (OSError, ValueError, AttributeError):
+        return True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
