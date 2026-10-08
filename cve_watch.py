@@ -390,7 +390,7 @@ def send_discord(text):
         import subprocess, json as json_module
         payload = json_module.dumps({"content": chunk})
         subprocess.run(
-            ["curl", "-s", "-o", "/dev/null", "-X", "POST", WEBHOOK,
+            ["/usr/bin/curl", "-s", "-o", "/dev/null", "-X", "POST", WEBHOOK,
              "-H", "Content-Type: application/json", "-d", payload],
             timeout=15
         )

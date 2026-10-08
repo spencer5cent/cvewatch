@@ -23,6 +23,9 @@ Mozilla-vendored and clearly local-only/mobile-only entries are excluded. This
 exists because the keyword gates miss most fresh KEV additions — NVD descriptions
 often don't contain the exact product or vuln-type phrase the lists require.
 
+Discord delivery can be controlled independently with
+`CVEWATCH_DISCORD_SETTINGS_FILE`. Point it at a JSON file containing
+`{"enabled": false}` to mute messages; a missing file defaults to enabled.
 
 Common usage:
 
