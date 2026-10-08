@@ -8,6 +8,12 @@ Alert logic:
   3. Matches a WEB-tier product AND a web-exploitable vuln type  → [WEB] alert
      OR matches a NETWORK-tier product AND a network vuln type   → [NETWORK] alert
   4. Dedup: skip already-seen CVEs unless a PoC signal newly appeared in the description
+  5. CISA KEV pass (added 2026-10-08): every CVSS/product/vuln-type gate above is bypassed
+     for anything CISA's Known Exploited Vulnerabilities catalog added recently. A 2026-10-08
+     audit found the gates above missed ~65 of 69 web/network KEV additions over one month —
+     NVD descriptions routinely omit the exact product/vuln-type phrase the keyword lists
+     require, or AC:H drops the score below the CVSS floor — so a CVE already confirmed
+     exploited in the wild was still silently dropped. See kev_alerts().
 """
 import os, sys, json, argparse, requests, datetime, re, time
 
@@ -323,9 +329,9 @@ def fetch_nvd(params):
 
 
 def best_cvss(metrics):
-    """Return (score, vector) for the highest available CVSS v3 entry."""
+    """Return (score, vector) for the highest available CVSS v3/v4 entry."""
     best_s, best_v = 0.0, ""
-    for k in ("cvssMetricV31", "cvssMetricV30"):
+    for k in ("cvssMetricV40", "cvssMetricV31", "cvssMetricV30"):
         for m in metrics.get(k, []):
             d = m.get("cvssData", {})
             s = d.get("baseScore", 0.0)
@@ -389,6 +395,47 @@ def send_discord(text):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ── CISA KEV pass ─────────────────────────────────────────────────────────────
+# Known-exploited CVEs bypass the CVSS/product/description gates above: the 2026
+# audit found ~65 of 69 web/network KEV additions (Artifactory, PaperCut, GitLab,
+# WordPress core, Zimbra, ...) never matched them (NVD descriptions often lack the
+# product or vuln-type phrase, or AC:H drops the score under the floor).
+KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+KEV_EXCLUDE_VENDORS = {"apple", "linux", "mozilla"}
+KEV_EXCLUDE_RE = re.compile(
+    r"\blocal(?:ly)? (?:attacker|user|privilege)|\bchromium\b|\bandroid\b|\bpixel\b|"
+    r"\bwindows (?:kernel|win32k|common log|ale|alpc|update stack)", re.I)
+
+
+def kev_alerts(sent, poc_state, window_hours, dry_run):
+    try:
+        r = requests.get(KEV_URL, timeout=45)
+        r.raise_for_status()
+        vulns = r.json().get("vulnerabilities", [])
+    except Exception as e:
+        print(f"KEV fetch failed: {e}", file=sys.stderr)
+        return 0, True
+    cutoff = (utcnow() - datetime.timedelta(hours=window_hours + 24)).date().isoformat()
+    n = 0
+    for v in sorted(vulns, key=lambda x: x.get("dateAdded", "")):
+        cid = v.get("cveID", "")
+        if v.get("dateAdded", "") < cutoff or cid in sent:
+            continue
+        text = " ".join(str(v.get(k, "")) for k in ("vendorProject", "product", "vulnerabilityName", "shortDescription"))
+        if v.get("vendorProject", "").lower() in KEV_EXCLUDE_VENDORS or KEV_EXCLUDE_RE.search(text):
+            continue
+        msg = (f"[KEV] 🔥 **{cid}** {v.get('vendorProject')} {v.get('product')}"
+               f"{' (ransomware use)' if v.get('knownRansomwareCampaignUse') == 'Known' else ''}\n"
+               f"{v.get('shortDescription', '')}\nhttps://nvd.nist.gov/vuln/detail/{cid}")
+        print(msg)
+        print()
+        n += 1
+        if not dry_run:
+            send_discord(msg)
+            sent[cid] = utcnow().isoformat()
+            poc_state[cid] = True
+    return n, False
+
 
 ap = argparse.ArgumentParser(description="Web-focused CVE watcher for security researchers")
 ap.add_argument("-min", type=float, default=8.5,
@@ -436,6 +483,8 @@ sent = state["sent"]
 poc_state = state["poc"]
 poc_refs_state = state["poc_refs"]
 alerted, checked = 0, 0
+kev_n, kev_failed = kev_alerts(sent, poc_state, args.window, args.dry_run)
+alerted += kev_n
 
 for item in fetch_nvd(params):
     c = item.get("cve", {})
@@ -551,5 +600,5 @@ if not args.dry_run:
     save_state(state)
 
 print(f"Done — {alerted} alert(s) from {checked} CVEs evaluated.")
-if FETCH_FAILED:
+if FETCH_FAILED or kev_failed:
     sys.exit(1)

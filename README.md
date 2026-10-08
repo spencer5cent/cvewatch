@@ -15,6 +15,15 @@ terminal page-fetch failure exits nonzero after preserving already processed
 state, allowing systemd to expose partial feed failures instead of treating a
 zero-alert partial run as healthy.
 
+A separate CISA KEV pass (added 2026-10-08) runs before the NVD/product-keyword
+pass and bypasses its CVSS/product/vuln-type gates entirely: anything CISA adds
+to its Known Exploited Vulnerabilities catalog within the run's window fires a
+`[KEV]` alert regardless of whether it would otherwise match. Only Apple/Linux/
+Mozilla-vendored and clearly local-only/mobile-only entries are excluded. This
+exists because the keyword gates miss most fresh KEV additions — NVD descriptions
+often don't contain the exact product or vuln-type phrase the lists require.
+
+
 Common usage:
 
 ```bash
