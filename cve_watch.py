@@ -19,6 +19,7 @@ import os, sys, json, argparse, requests, datetime, re, time, subprocess
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(BASE_DIR, "state.json")
+SUMMARY_FILE = os.getenv("CVEWATCH_SUMMARY_FILE", "/var/cache/cve-watch/kindle-summary.json")
 UTC = datetime.timezone.utc
 NVD_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 MAX_LEN = 1900  # Discord message limit with safety margin
@@ -422,7 +423,7 @@ KEV_EXCLUDE_RE = re.compile(
     r"\bwindows (?:kernel|win32k|common log|ale|alpc|update stack)", re.I)
 
 
-def kev_alerts(sent, poc_state, window_hours, dry_run):
+def kev_alerts(sent, poc_state, window_hours, dry_run, run_alerts):
     try:
         # This is a public catalog feed, not target traffic. Use the system curl
         # explicitly so the scanner's PATH/request gate cannot turn a scheduled
@@ -451,11 +452,57 @@ def kev_alerts(sent, poc_state, window_hours, dry_run):
         print(msg)
         print()
         n += 1
+        run_alerts.append({
+            "id": cid,
+            "kind": "KEV",
+            "product": " ".join(filter(None, [v.get("vendorProject", ""), v.get("product", "")])),
+            "score": None,
+            "poc": True,
+            "at": utcnow().isoformat(),
+        })
         if not dry_run:
             send_discord(msg)
             sent[cid] = utcnow().isoformat()
             poc_state[cid] = True
     return n, False
+
+
+def save_kindle_summary(run_alerts, sent=None, poc_state=None):
+    """Keep a small, secret-free seven-day alert window for passive displays."""
+    cutoff = utcnow() - datetime.timedelta(days=7)
+    previous = []
+    try:
+        with open(SUMMARY_FILE) as fp:
+            previous = json.load(fp).get("alerts", [])
+    except (OSError, ValueError, AttributeError):
+        pass
+    merged = {}
+    # The first deployment can seed identifiers/timestamps from the existing
+    # dedup state; subsequent runs enrich newly observed alerts with product,
+    # tier, and score.
+    for cid, when in (sent or {}).items():
+        try:
+            seen_at = datetime.datetime.fromisoformat(str(when).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            continue
+        if seen_at >= cutoff:
+            merged[str(cid)] = {"id": str(cid), "kind": "", "product": "", "score": None,
+                                "poc": bool((poc_state or {}).get(cid)), "at": str(when)}
+    for row in previous + run_alerts:
+        try:
+            when = datetime.datetime.fromisoformat(str(row.get("at", "")).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            continue
+        if when >= cutoff and row.get("id"):
+            merged[str(row["id"])] = row
+    alerts = sorted(merged.values(), key=lambda row: str(row.get("at", "")), reverse=True)[:20]
+    os.makedirs(os.path.dirname(SUMMARY_FILE), mode=0o755, exist_ok=True)
+    tmp = SUMMARY_FILE + ".tmp"
+    with open(tmp, "w") as fp:
+        json.dump({"generated_at": utcnow().isoformat(), "alerts": alerts}, fp, indent=2)
+        fp.write("\n")
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, SUMMARY_FILE)
 
 
 ap = argparse.ArgumentParser(description="Web-focused CVE watcher for security researchers")
@@ -477,6 +524,8 @@ ap.add_argument("-clear-state", action="store_true",
                 help="Reset dedup state and exit")
 ap.add_argument("-send-test", action="store_true",
                 help="Send a test Discord message and exit")
+ap.add_argument("-refresh-summary", action="store_true",
+                help="Refresh the passive-display summary from existing state and exit")
 args = ap.parse_args()
 
 if args.clear_state:
@@ -492,6 +541,12 @@ if args.send_test:
     print("Test message sent.")
     sys.exit(0)
 
+if args.refresh_summary:
+    saved = load_state()
+    save_kindle_summary([], saved["sent"], saved["poc"])
+    print(f"Summary refreshed at {SUMMARY_FILE}.")
+    sys.exit(0)
+
 # ── Fetch ─────────────────────────────────────────────────────────────────────
 now = utcnow()
 params = {
@@ -504,7 +559,8 @@ sent = state["sent"]
 poc_state = state["poc"]
 poc_refs_state = state["poc_refs"]
 alerted, checked = 0, 0
-kev_n, kev_failed = kev_alerts(sent, poc_state, args.window, args.dry_run)
+run_alerts = []
+kev_n, kev_failed = kev_alerts(sent, poc_state, args.window, args.dry_run, run_alerts)
 alerted += kev_n
 
 for item in fetch_nvd(params):
@@ -608,6 +664,14 @@ for item in fetch_nvd(params):
     print(msg)
     print()
     alerted += 1
+    run_alerts.append({
+        "id": cid,
+        "kind": tier_label,
+        "product": matched_products[0] if matched_products else "",
+        "score": score,
+        "poc": bool(has_poc),
+        "at": now.isoformat(),
+    })
 
     if not args.dry_run:
         send_discord(msg)
@@ -619,6 +683,7 @@ state["poc"] = poc_state
 state["poc_refs"] = poc_refs_state
 if not args.dry_run:
     save_state(state)
+    save_kindle_summary(run_alerts, sent, poc_state)
 
 print(f"Done — {alerted} alert(s) from {checked} CVEs evaluated.")
 if FETCH_FAILED or kev_failed:
