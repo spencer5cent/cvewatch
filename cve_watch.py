@@ -17,9 +17,12 @@ Alert logic:
 """
 import os, sys, json, argparse, requests, datetime, re, time, subprocess
 
+import intelligence
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(BASE_DIR, "state.json")
 SUMMARY_FILE = os.getenv("CVEWATCH_SUMMARY_FILE", "/var/cache/cve-watch/kindle-summary.json")
+INTELLIGENCE_FILE = os.getenv("CVEWATCH_INTELLIGENCE_FILE", "/var/cache/cve-watch/fleet-feed.json")
 UTC = datetime.timezone.utc
 NVD_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 MAX_LEN = 1900  # Discord message limit with safety margin
@@ -276,7 +279,7 @@ def load_state():
     try:
         raw = json.load(open(STATE_FILE))
     except Exception:
-        return {"sent": {}, "poc": {}, "poc_refs": {}}
+        return {"sent": {}, "poc": {}, "poc_refs": {}, "nvd_cursor_end": ""}
     sent = raw.get("sent", {})
     poc = raw.get("poc", {})
     poc_refs = raw.get("poc_refs", {})
@@ -289,7 +292,8 @@ def load_state():
                 poc[k] = v.get("had_poc", False)
         else:
             new_sent[k] = v
-    return {"sent": new_sent, "poc": poc, "poc_refs": poc_refs}
+    return {"sent": new_sent, "poc": poc, "poc_refs": poc_refs,
+            "nvd_cursor_end": str(raw.get("nvd_cursor_end") or "")}
 
 
 def save_state(state):
@@ -308,7 +312,7 @@ def fetch_nvd(params):
     while True:
         p = dict(params, resultsPerPage=200, startIndex=start)
         last_error = None
-        for attempt in range(3):
+        for attempt in range(5):
             try:
                 r = requests.get(NVD_URL, params=p, headers=headers, timeout=45)
                 r.raise_for_status()
@@ -316,11 +320,11 @@ def fetch_nvd(params):
                 break
             except Exception as e:
                 last_error = e
-                if attempt < 2:
-                    time.sleep(2 ** attempt)
+                if attempt < 4:
+                    time.sleep(2 ** (attempt + 1))
         if last_error is not None:
             FETCH_FAILED = True
-            print(f"NVD fetch failed after 3 attempts at startIndex={start}: {last_error}", file=sys.stderr)
+            print(f"NVD fetch failed after 5 attempts at startIndex={start}: {last_error}", file=sys.stderr)
             return
         data = r.json()
         vulns = data.get("vulnerabilities", [])
@@ -331,6 +335,9 @@ def fetch_nvd(params):
         start += 200
         if start >= data.get("totalResults", 0):
             return
+        # NVD permits 50 requests/30 seconds with a key and 5/30 without one.
+        # Long catch-up windows must pace every page, not rely on 503 retries.
+        time.sleep(0.75 if NVD_KEY else 6.5)
 
 
 def best_cvss(metrics):
@@ -374,7 +381,7 @@ def poc_reference_urls(cve):
 
 def send_discord(text):
     if not WEBHOOK or not cvewatch_discord_enabled():
-        return
+        return True
     # Chunk if over Discord's limit
     chunks, buf = [], ""
     for line in text.split("\n"):
@@ -390,13 +397,17 @@ def send_discord(text):
     for chunk in chunks:
         import subprocess, json as json_module
         payload = json_module.dumps({"content": chunk})
-        subprocess.run(
-            ["/usr/bin/curl", "-s", "-o", "/dev/null", "-X", "POST", WEBHOOK,
+        result = subprocess.run(
+            ["curl", "--fail", "--silent", "--show-error", "-o", "/dev/null",
+             "-X", "POST", WEBHOOK,
              "-H", "Content-Type: application/json", "-d", payload],
             timeout=15
         )
+        if result.returncode != 0:
+            return False
         if len(chunks) > 1:
             time.sleep(0.5)
+    return True
 
 
 def cvewatch_discord_enabled():
@@ -461,9 +472,11 @@ def kev_alerts(sent, poc_state, window_hours, dry_run, run_alerts):
             "at": utcnow().isoformat(),
         })
         if not dry_run:
-            send_discord(msg)
-            sent[cid] = utcnow().isoformat()
-            poc_state[cid] = True
+            if send_discord(msg):
+                sent[cid] = utcnow().isoformat()
+                poc_state[cid] = True
+            else:
+                print(f"Discord delivery failed for {cid}; leaving it eligible for retry", file=sys.stderr)
     return n, False
 
 
@@ -549,17 +562,19 @@ if args.refresh_summary:
 
 # ── Fetch ─────────────────────────────────────────────────────────────────────
 now = utcnow()
+state = load_state()
 params = {
-    "lastModStartDate": (now - datetime.timedelta(hours=args.window)).isoformat(),
+    "lastModStartDate": intelligence.nvd_window_start(
+        now, args.window, state.get("nvd_cursor_end", "")).isoformat(),
     "lastModEndDate": now.isoformat(),
 }
 
-state = load_state()
 sent = state["sent"]
 poc_state = state["poc"]
 poc_refs_state = state["poc_refs"]
 alerted, checked = 0, 0
 run_alerts = []
+intelligence_rows = []
 kev_n, kev_failed = kev_alerts(sent, poc_state, args.window, args.dry_run, run_alerts)
 alerted += kev_n
 
@@ -575,6 +590,14 @@ for item in fetch_nvd(params):
     desc = desc_obj.get("value", "") or c.get("descriptions", [{}])[0].get("value", "")
 
     score, vector = best_cvss(c.get("metrics", {}))
+
+    # Durable fleet intelligence is deliberately recorded before every alert
+    # policy gate. Android/iOS/client/kernel, old, low/medium, authenticated,
+    # and non-network records remain available for exact downstream joins.
+    intelligence_row = intelligence.compact_record(
+        c, observed_at=now.isoformat(), poc_urls=poc_reference_urls(c))
+    if intelligence_row:
+        intelligence_rows.append(intelligence_row)
 
     def skip(reason):
         if args.debug:
@@ -674,14 +697,23 @@ for item in fetch_nvd(params):
     })
 
     if not args.dry_run:
-        send_discord(msg)
-        sent[cid] = now.isoformat()
-        poc_state[cid] = has_poc
+        if send_discord(msg):
+            sent[cid] = now.isoformat()
+            poc_state[cid] = has_poc
+            state.update({"sent": sent, "poc": poc_state, "poc_refs": poc_refs_state})
+            save_state(state)
+        else:
+            print(f"Discord delivery failed for {cid}; leaving it eligible for retry", file=sys.stderr)
 
 state["sent"] = sent
 state["poc"] = poc_state
 state["poc_refs"] = poc_refs_state
 if not args.dry_run:
+    if not FETCH_FAILED:
+        state["nvd_cursor_end"] = now.isoformat()
+        intelligence.update_feed(
+            INTELLIGENCE_FILE, intelligence_rows, generated_at=now.isoformat(),
+            cursor_end=now.isoformat())
     save_state(state)
     save_kindle_summary(run_alerts, sent, poc_state)
 
